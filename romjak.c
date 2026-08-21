@@ -9,9 +9,168 @@
 
 #define MAXROMS		16
 #define MAXROMWIDTH	32
-#define MAXSTRIDE	(MAXROMWIDTH/8)
+#define MAXSTRIDE	(MAXROMWIDTH / 8)
 #define MAXBANKS	4
-#define MAXROMSPERBANK (MAXROMS/MAXBANKS)
+#define MAXNAME		256
+/* Leaves room for the ".<bank>.<rom>" suffix we append */
+#define MAXBASENAME	(MAXNAME - 16)
+
+/*
+ * How a binary is spread over a set of ROMs.
+ *
+ * The ROMs of a bank sit side by side on the data bus, so consecutive
+ * bytes of the binary land in different chips: each ROM takes `stride`
+ * bytes (its share of the bus width) before the next one gets a turn.
+ * Banks stack up the address space, one whole bank after another.
+ *
+ * Splitting and joining walk exactly the same geometry, one in each
+ * direction, which is why they share this.
+ */
+struct romgeom {
+	/* as asked for */
+	int numroms;
+	int romsize;
+	int romwidth;		/* bits */
+	int rombanks;
+	int paduptosize;
+	int padbyte;
+
+	/* worked out from the above */
+	int stride;		/* bytes one ROM takes at a time */
+	int romsperbank;
+	int banksz;
+	int totalsz;
+	int repeats;
+};
+
+/*
+ * Fill in the derived fields and check the whole lot hangs together.
+ * Returns NULL if it does, or a message saying what does not.
+ */
+static const char *geom_derive(struct romgeom *g)
+{
+	static char err[192];
+
+	if (g->numroms < 1) {
+		snprintf(err, sizeof(err), "there must be at least 1 ROM");
+		return err;
+	}
+	if (g->numroms > MAXROMS) {
+		snprintf(err, sizeof(err), "sorry, too many ROMs (max %d)", MAXROMS);
+		return err;
+	}
+	if (g->romsize < 1) {
+		snprintf(err, sizeof(err), "romsize must be at least 1 byte");
+		return err;
+	}
+	if (g->rombanks < 1) {
+		snprintf(err, sizeof(err), "there must be at least 1 bank");
+		return err;
+	}
+	if (g->rombanks > MAXBANKS) {
+		snprintf(err, sizeof(err), "sorry, too many banks (max %d)", MAXBANKS);
+		return err;
+	}
+	if ((g->numroms % g->rombanks) != 0) {
+		snprintf(err, sizeof(err),
+				"number of ROMs (%d) must be a multiple of the number of banks (%d)",
+				g->numroms, g->rombanks);
+		return err;
+	}
+	if ((g->romwidth % 8) != 0) {
+		snprintf(err, sizeof(err), "ROM width must be a multiple of 8 bits");
+		return err;
+	}
+	if (g->romwidth < 8 || g->romwidth > MAXROMWIDTH) {
+		snprintf(err, sizeof(err), "ROM width must be between 8 and %d bits",
+				MAXROMWIDTH);
+		return err;
+	}
+	if (g->padbyte < 0 || g->padbyte > 0xff) {
+		snprintf(err, sizeof(err), "the pad byte must be between 0 and 255");
+		return err;
+	}
+
+	g->stride = g->romwidth / 8;
+	g->romsperbank = g->numroms / g->rombanks;
+	g->banksz = g->romsize * g->romsperbank;
+	g->totalsz = g->romsize * g->numroms;
+
+	if ((g->romsize % g->stride) != 0) {
+		snprintf(err, sizeof(err),
+				"romsize (%d) must be a multiple of the ROM stride (%d bytes)",
+				g->romsize, g->stride);
+		return err;
+	}
+
+	if (g->paduptosize < 1)
+		g->paduptosize = g->totalsz;
+
+	/*
+	 * The input is walked sequentially, one stride at a time, and
+	 * rewound every time we cross a paduptosize boundary. That only
+	 * lines up if the boundaries fall on a stride, and if the output
+	 * is a whole number of copies.
+	 */
+	if ((g->paduptosize % g->stride) != 0) {
+		snprintf(err, sizeof(err),
+				"paduptosize (%d) must be a multiple of the ROM stride (%d bytes)",
+				g->paduptosize, g->stride);
+		return err;
+	}
+	if ((g->totalsz % g->paduptosize) != 0) {
+		snprintf(err, sizeof(err),
+				"total size (%d) must be a multiple of paduptosize (%d)",
+				g->totalsz, g->paduptosize);
+		return err;
+	}
+
+	g->repeats = g->totalsz / g->paduptosize;
+
+	return NULL;
+}
+
+/*
+ * Work out a default output basename from the input path:
+ * "roms/game.bin" becomes "game".
+ */
+static void default_basename(const char *path, char *out, size_t outsz)
+{
+	const char *slash = strrchr(path, '/');
+	const char *start = slash ? slash + 1 : path;
+	const char *dot = strrchr(start, '.');
+	size_t len = dot ? (size_t)(dot - start) : strlen(start);
+
+	/* A name like ".bin" has no stem, so keep the lot */
+	if (len == 0)
+		len = strlen(start);
+	if (len >= outsz)
+		len = outsz - 1;
+	if (len == 0) {
+		snprintf(out, outsz, "rom");
+		return;
+	}
+
+	memcpy(out, start, len);
+	out[len] = '\0';
+}
+
+/*
+ * Name every image. One bank gets "<base>.<rom>", several banks get
+ * "<base>.<bank>.<rom>" so the ordering stays obvious.
+ */
+static void geom_names(const struct romgeom *g, const char *basename,
+		char names[MAXBANKS][MAXROMS][MAXNAME])
+{
+	for (int i = 0; i < g->rombanks; i++) {
+		for (int j = 0; j < g->romsperbank; j++) {
+			if (g->rombanks == 1)
+				snprintf(names[i][j], MAXNAME, "%s.%d", basename, j);
+			else
+				snprintf(names[i][j], MAXNAME, "%s.%d.%d", basename, i, j);
+		}
+	}
+}
 
 static int get_arg_or_default(struct arg_int *arg, int defval)
 {
@@ -21,11 +180,200 @@ static int get_arg_or_default(struct arg_int *arg, int defval)
 		return defval;
 }
 
-int main(int argc, char **argv) {
-	struct arg_lit *help;
+/*
+ * Drawing the layout.
+ *
+ * The picture is the same shape as the hardware: ROMs of a bank side by
+ * side across the data bus, banks stacked down the address space.
+ */
+#define LAYOUT_MARGIN	9	/* room for " bank 0" */
+#define LAYOUT_COLS	100	/* keep the picture inside a sane terminal */
+
+/* Print s centred in `width` columns, chopping the front off if it will not fit */
+static void cell(const char *s, int width)
+{
+	char buf[MAXNAME + 8];
+	int len = (int)strlen(s);
+
+	if (len > width) {
+		snprintf(buf, sizeof(buf), "..%s", s + len - (width - 2));
+		len = width;
+	} else {
+		snprintf(buf, sizeof(buf), "%s", s);
+	}
+
+	int left = (width - len) / 2;
+	printf("%*s%s%*s", left, "", buf, width - len - left, "");
+}
+
+static void rule(const struct romgeom *g, int cellw)
+{
+	printf("%*s+", LAYOUT_MARGIN, "");
+	for (int j = 0; j < g->romsperbank; j++) {
+		for (int k = 0; k < cellw; k++)
+			putchar('-');
+		putchar('+');
+	}
+	putchar('\n');
+}
+
+static void print_layout(const struct romgeom *g,
+		char names[MAXBANKS][MAXROMS][MAXNAME])
+{
+	/* Wide enough for the names, but not so wide it wraps */
+	int cellw = 12;
+	for (int i = 0; i < g->rombanks; i++) {
+		for (int j = 0; j < g->romsperbank; j++) {
+			int need = (int)strlen(names[i][j]) + 4;
+			if (need > cellw)
+				cellw = need;
+		}
+	}
+
+	int maxw = (LAYOUT_COLS - LAYOUT_MARGIN) / g->romsperbank - 1;
+	if (cellw > maxw)
+		cellw = maxw;
+	if (cellw < 9)
+		cellw = 9;
+
+	/* Which bytes of each bus word this column carries */
+	printf("%*s", LAYOUT_MARGIN, "");
+	for (int j = 0; j < g->romsperbank; j++) {
+		char lane[32];
+
+		if (g->stride == 1)
+			snprintf(lane, sizeof(lane), "byte +%d", j);
+		else
+			snprintf(lane, sizeof(lane), "bytes +%d..%d",
+					j * g->stride, ((j + 1) * g->stride) - 1);
+
+		/* Chopping the front off a lane label loses the useful half */
+		if ((int)strlen(lane) > cellw)
+			snprintf(lane, sizeof(lane), "+%d..%d",
+					j * g->stride, ((j + 1) * g->stride) - 1);
+
+		putchar(' ');
+		cell(lane, cellw);
+	}
+	putchar('\n');
+
+	rule(g, cellw);
+
+	for (int i = 0; i < g->rombanks; i++) {
+		char left[24];
+		char sz[32];
+
+		snprintf(left, sizeof(left), " bank %d", i);
+		snprintf(sz, sizeof(sz), "%d B", g->romsize);
+
+		printf("%-*s|", LAYOUT_MARGIN, left);
+		for (int j = 0; j < g->romsperbank; j++) {
+			cell(names[i][j], cellw);
+			putchar('|');
+		}
+		printf("  0x%08x\n", (unsigned int)(g->banksz * i));
+
+		printf("%*s|", LAYOUT_MARGIN, "");
+		for (int j = 0; j < g->romsperbank; j++) {
+			cell(sz, cellw);
+			putchar('|');
+		}
+		printf("   - 0x%08x\n", (unsigned int)((g->banksz * (i + 1)) - 1));
+
+		rule(g, cellw);
+	}
+}
+
+/*
+ * Draw what ends up in the combined address space: how much of each
+ * paduptosize slot is real data and how much is 0xff filler.
+ */
+#define BARW	64
+
+static void print_datamap(const struct romgeom *g, long inputsize)
+{
+	long datalen = inputsize < g->paduptosize ? inputsize : g->paduptosize;
+
+	if (inputsize > g->paduptosize)
+		printf("The input is %ld bytes but only %d fit in a copy, so it will be truncated.\n",
+				inputsize, g->paduptosize);
+
+	if (g->repeats > 16) {
+		printf("%d copies of %ld bytes of data + %d bytes of 0x%02x pad, too many to draw.\n",
+				g->repeats, datalen, g->paduptosize - (int)datalen, g->padbyte);
+		return;
+	}
+
+	int seg = BARW / g->repeats;
+	if (seg < 4)
+		seg = 4;
+
+	/* Round up so even a sliver of data is visible */
+	int datacols = (int)(((datalen * seg) + g->paduptosize - 1) / g->paduptosize);
+	if (datacols < 1)
+		datacols = 1;
+	if (datacols > seg)
+		datacols = seg;
+
+	int barw = seg * g->repeats;
+
+	/* The two address labels are 10 wide, space them out to the bar ends */
+	int gap = barw + 2 - (10 * 2);
+	if (gap < 1)
+		gap = 1;
+
+	printf("%*s0x%08x%*s0x%08x\n", LAYOUT_MARGIN, "", 0,
+			gap, "", (unsigned int)g->totalsz);
+
+	printf("%*s+", LAYOUT_MARGIN, "");
+	for (int i = 0; i < g->repeats; i++) {
+		for (int k = 0; k < seg; k++)
+			putchar('-');
+		putchar('+');
+	}
+	putchar('\n');
+
+	printf("%*s|", LAYOUT_MARGIN, "");
+	for (int i = 0; i < g->repeats; i++) {
+		for (int k = 0; k < seg; k++)
+			putchar(k < datacols ? '#' : '.');
+		putchar('|');
+	}
+	putchar('\n');
+
+	printf("%*s+", LAYOUT_MARGIN, "");
+	for (int i = 0; i < g->repeats; i++) {
+		for (int k = 0; k < seg; k++)
+			putchar('-');
+		putchar('+');
+	}
+	putchar('\n');
+
+	printf("%*s# %ld bytes of data   . %d bytes of 0x%02x pad   x %d cop%s of %d bytes\n",
+			LAYOUT_MARGIN, "", datalen, g->paduptosize - (int)datalen,
+			g->padbyte, g->repeats, g->repeats == 1 ? "y" : "ies",
+			g->paduptosize);
+}
+
+/*
+ * Walk the combined address space one stride at a time, in the order the
+ * bytes appear in the binary, handing back which bank and ROM each stride
+ * belongs to. This is the whole interleave, and both directions use it.
+ */
+#define for_each_stride(g, bank, rom, pos)					\
+	for (int bank = 0; bank < (g)->rombanks; bank++)			\
+		for (int row = 0; row < (g)->banksz;				\
+				row += (g)->romsperbank * (g)->stride)		\
+			for (int rom = 0, pos = (bank) * (g)->banksz + row;	\
+					rom < (g)->romsperbank;			\
+					rom++, pos += (g)->stride)
+
+static int cmd_split(int argc, char **argv)
+{
+	struct arg_lit *help, *arg_dryrun;
 	struct arg_int *arg_numroms, *arg_romwidth,
 				   *arg_romsize, *arg_rombanks,
-				   *arg_paduptosize;
+				   *arg_paduptosize, *arg_pad;
 	struct arg_file *arg_input;
 	struct arg_str *arg_basename;
 	struct arg_end *end;
@@ -34,206 +382,420 @@ int main(int argc, char **argv) {
 			"Data bus width of a single ROM in bits (multiple of 8), defaults to 8";
 
 	static const char *paduptosize_help =
-			"How much to pad the input data up to."
+			"How much to pad the input data up to. "
 			"For example if you have a 4KB input, "
-			"pad up to 32KB and the bank is 64KB "
+			"pad up to 32KB and the total is 64KB "
 			"you'll get two copies of the input "
-			"padded up to 32KB with 0xff."
+			"padded up to 32KB with 0xff. "
 			"If the input is bigger than this value "
-			"it will be truncated."
-			"If this value is missing padding will be"
+			"it will be truncated. "
+			"If this value is missing padding will be "
 			"added to fill up the total size.";
 
 	static const char *basename_help =
 			"Base name for the outputs, defaults to something based on the input path";
 
 	void *argtable[] = {
-		help            = arg_litn(NULL, "help", 0, 1, "display this help and exit"),
+		help            = arg_litn("h", "help", 0, 1, "display this help and exit"),
 		arg_numroms     = arg_int1(NULL, "numroms", "<n>", "Total number of ROMs"),
 		arg_romwidth    = arg_intn(NULL, "romwidth", "<n>", 0, 1, romwidth_help),
 		arg_romsize     = arg_int1(NULL, "romsize", "<n>", "Size of a single ROM in bytes"),
-		arg_rombanks    = arg_intn(NULL, "rombanks", "<n>", 0, 1, "How many banks of ROMS, defaults to 1"),
+		arg_rombanks    = arg_intn(NULL, "rombanks", "<n>", 0, 1, "How many banks of ROMs, defaults to 1"),
 		arg_paduptosize = arg_intn(NULL, "paduptosize", "<n>", 0, 1, paduptosize_help),
+		arg_pad         = arg_intn(NULL, "pad", "<byte>", 0, 1,
+					"Byte value to pad with, defaults to 0xff (erased EPROM)"),
+		arg_dryrun      = arg_litn("n", "dry-run", 0, 1,
+					"Show the layout and work out the sizes, but write nothing"),
 		arg_input       = arg_file1(NULL, NULL, "<file>", "input file"),
 		arg_basename    = arg_strn(NULL, NULL, "<output basename>", 0, 1, basename_help),
 		end             = arg_end(20),
 	};
 
-	int nerrors;
-	nerrors = arg_parse(argc,argv,argtable);
+	const char *progname = "romjak split";
+	int nerrors = arg_parse(argc, argv, argtable);
 
-	char progname[] = "romjak";
-
-	if (help->count > 0)
-	{
+	if (help->count > 0) {
 		printf("Usage: %s", progname);
 		arg_print_syntax(stdout, argtable, "\n");
-		printf("Demonstrate command-line parsing in argtable3.\n\n");
+		printf("Split a binary across a set of ROM images for burning.\n\n");
 		arg_print_glossary(stdout, argtable, "  %-25s %s\n");
-		exit(0);
+		printf("\nSizes accept 0x hex and KB/MB suffixes, eg --romsize=32KB\n");
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 0;
 	}
 
-	if (nerrors > 0)
-	{
-		arg_print_errors(stdout, end, progname);
-		printf("Try '%s --help' for more information.\n", progname);
-		exit(1);
+	if (nerrors > 0) {
+		arg_print_errors(stderr, end, progname);
+		fprintf(stderr, "Try 'romjak split --help' for more information.\n");
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 1;
 	}
 
-	/*
-	 * Get the number of ROMs and size of each
-	 * and work out what the total size is.
-	 */
-	int numroms = *arg_numroms->ival;
-	int romsize = *arg_romsize->ival;
-	int totalsz = romsize * numroms;
+	struct romgeom g = {
+		.numroms     = arg_numroms->ival[0],
+		.romsize     = arg_romsize->ival[0],
+		.romwidth    = get_arg_or_default(arg_romwidth, 8),
+		.rombanks    = get_arg_or_default(arg_rombanks, 1),
+		.paduptosize = get_arg_or_default(arg_paduptosize, 0),
+		.padbyte     = get_arg_or_default(arg_pad, 0xff),
+	};
 
-	/*
-	 * Get the user specified padding up to size,
-	 * set to the total size if unspecified.
-	 */
-	const int paduptosize = get_arg_or_default(arg_paduptosize, totalsz);
-
-	/* Get the number of ROM banks, 1 if unspecified */
-	const int rombanks = get_arg_or_default(arg_rombanks, 1);
-
-	/* Get the width of each ROM, 8 if unspecified */
-	const int romwidth = get_arg_or_default(arg_romwidth, 8);
-
-	/* Check the numbers are logical */
-	/* Banks */
-	if (rombanks > MAXBANKS) {
-		printf("Sorry, too many banks\n");
-		exit(1);
+	const char *err = geom_derive(&g);
+	if (err) {
+		fprintf(stderr, "%s: %s\n", progname, err);
+		return 1;
 	}
-
-	/* ROM width */
-	if ((romwidth % 8) != 0) {
-		printf("ROM width needs to be a multiple of 8\n");
-		exit(1);
-	}
-	if (romwidth > MAXROMWIDTH) {
-		printf("ROM width is too big\n");
-		exit(1);
-	}
-
-#if 0
-	/* Pad size */
-	if ((romsize % paduptosize) != 0) {
-		printf("romsize must be a multiple of paduptosize\n");
-		exit(1);
-	}
-#endif
-
-	/* Number of ROMs */
-	if ((numroms % rombanks) != 0) {
-		printf("number of ROMs must be a multiple of number of banks\n");
-		exit(1);
-	}
-
-	if (numroms > MAXROMS) {
-		printf("Sorry, too many ROMs\n");
-		exit(1);
-	}
-
-	/* Calculate the stride, repeats etc, sizes */
-	int romsperbank = numroms / rombanks;
-	int banksz = romsize * romsperbank;
-
-	int stride = romwidth / 8;
-	int repeats = romsize / paduptosize;
-
-	/* Print it all out because I no good at math */
-	printf("Going to create outputs for %d ROMs:\n"
-		   " - Total data to generate %d bytes, %d bytes per bank\n"
-		   " - Each image will be %d bytes long\n"
-		   " - Input data stride (how many bytes put into an output at a time) is %d bytes\n"
-		   " - Input data will be repeated %d times\n",
-			numroms, totalsz, banksz, romsize, stride, repeats);
 
 	/* Work out the resulting file names */
-	const char *basename = arg_basename->sval[0];
-	char output_names[MAXBANKS][MAXROMS][256] = { 0 };
-	if (rombanks == 1) {
-		for (int i = 0; i < romsperbank; i++)
-			sprintf(output_names[0][i], "%s.%d", basename, i);
-	}
-	else {
-		for (int i = 0; i < rombanks; i++) {
-			for (int j = 0; j < romsperbank; j++)
-				sprintf(output_names[i][j], "%s.%d.%d", basename, i, j);
-		}
-	}
+	char basename[MAXBASENAME];
+	if (arg_basename->count && arg_basename->sval[0] && arg_basename->sval[0][0])
+		snprintf(basename, sizeof(basename), "%s", arg_basename->sval[0]);
+	else
+		default_basename(arg_input->filename[0], basename, sizeof(basename));
 
-	printf("Your output images will be like this:\n");
-	for (int i = 0; i < rombanks; i++) {
-		unsigned int bank_start = banksz * i;
-		unsigned int bank_end = (banksz * (i + 1)) - 1;
+	char names[MAXBANKS][MAXROMS][MAXNAME] = { 0 };
+	geom_names(&g, basename, names);
 
-		printf(" - bank %d [0x%08x - 0x%08x]:", i, bank_start, bank_end);
-		for (int j = 0; j < romsperbank; j++) {
-			printf(" rom %d - %s", j, output_names[i][j]);
-		}
-		printf("\n");
-	}
-
-	/* Open all of the files */
-	FILE *outputs[MAXBANKS][MAXROMSPERBANK] = { 0 };
-	FILE *input = fopen(arg_input->filename[0], "r");
+	FILE *input = fopen(arg_input->filename[0], "rb");
 	if (!input) {
-		printf("Couldn't open the input file: %d\n", errno);
-		exit(1);
+		fprintf(stderr, "Couldn't open the input file '%s': %s\n",
+				arg_input->filename[0], strerror(errno));
+		return 1;
 	}
 
 	/* Get the input size */
 	fseek(input, 0L, SEEK_END);
-	int inputsize = ftell(input);
+	long inputsize = ftell(input);
 	rewind(input);
 
-	for (int i = 0; i < rombanks; i++) {
-		for (int j = 0; j < romsperbank; j++) {
-			outputs[i][j] = fopen(output_names[i][j], "w");
+	if (inputsize <= 0) {
+		fprintf(stderr, "The input file is empty\n");
+		return 1;
+	}
+
+	/* Print it all out because I no good at math */
+	printf("Splitting %s (%ld bytes) over %d ROMs of %d bytes, %d bank(s), %d-bit each:\n\n",
+			arg_input->filename[0], inputsize, g.numroms, g.romsize,
+			g.rombanks, g.romwidth);
+
+	print_layout(&g, names);
+
+	printf("\nWhich holds %d bytes altogether, laid out like this:\n\n", g.totalsz);
+
+	print_datamap(&g, inputsize);
+
+	putchar('\n');
+
+	if (arg_dryrun->count) {
+		printf("Dry run, nothing written.\n");
+		fclose(input);
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 0;
+	}
+
+	/* Open all of the outputs */
+	FILE *outputs[MAXBANKS][MAXROMS] = { 0 };
+
+	for (int i = 0; i < g.rombanks; i++) {
+		for (int j = 0; j < g.romsperbank; j++) {
+			outputs[i][j] = fopen(names[i][j], "wb");
 			if (!outputs[i][j]) {
-				printf("Couldn't open one of the outputs for writing: %d\n", errno);
-				exit(1);
+				fprintf(stderr, "Couldn't open '%s' for writing: %s\n",
+						names[i][j], strerror(errno));
+				return 1;
 			}
 		}
 	}
 
 	printf("Doing it..\n");
 
-	/* Bank by bank */
-	for (int this_bank = 0; this_bank < rombanks; this_bank++) {
-		/* Row by row within a bank */
-		for (int pos_bank = 0; pos_bank < banksz; pos_bank += (romsperbank * stride))
-			/* ROM by ROM with the row */
-			for (int this_rom = 0; this_rom < romsperbank; this_rom++) {
-				FILE *output = outputs[this_bank][this_rom];
-				uint8_t data[MAXSTRIDE];
-				memset(data, 0xff, sizeof(data));
+	for_each_stride(&g, this_bank, this_rom, pos_abs) {
+		FILE *output = outputs[this_bank][this_rom];
+		uint8_t data[MAXSTRIDE];
+		memset(data, g.padbyte, sizeof(data));
 
-				/* Ok, so were are we in the complete output? */
-				unsigned int pos_abs = (this_bank * banksz) + pos_bank + (this_rom * stride);
-				/* Ok, were are we in the current repeat */
-				unsigned int pos_repeat = pos_abs % paduptosize;
+		/* Where are we in the current repeat of the input? */
+		unsigned int pos_repeat = pos_abs % g.paduptosize;
 
-				if (pos_repeat == 0)
-					rewind(input);
+		if (pos_repeat == 0)
+			rewind(input);
 
-				if (pos_repeat < inputsize)
-					fread(data, stride, 1, input);
+		/*
+		 * A short read at the tail of the input just leaves the rest
+		 * of the stride as pad, which is what we want.
+		 */
+		if (pos_repeat < (unsigned long)inputsize)
+			fread(data, 1, g.stride, input);
 
-#if 0
-				printf("bank %d, rom %d, bank pos 0x%08x, abs pos 0x%08x, repeat pos 0x%08x\n",
-						this_bank, this_rom, pos_bank + (this_rom * stride),
-						pos_abs, pos_repeat);
-#endif
+		if (fwrite(data, 1, g.stride, output) != (size_t)g.stride) {
+			fprintf(stderr, "Write to '%s' failed: %s\n",
+					names[this_bank][this_rom], strerror(errno));
+			return 1;
+		}
+	}
 
-				fwrite(data, stride, 1, output);
+	if (ferror(input)) {
+		fprintf(stderr, "Read from '%s' failed: %s\n",
+				arg_input->filename[0], strerror(errno));
+		return 1;
+	}
+
+	fclose(input);
+	for (int i = 0; i < g.rombanks; i++) {
+		for (int j = 0; j < g.romsperbank; j++) {
+			if (fclose(outputs[i][j]) != 0) {
+				fprintf(stderr, "Couldn't finish writing '%s': %s\n",
+						names[i][j], strerror(errno));
+				return 1;
 			}
+		}
 	}
 
 	printf("Done\n");
 
+	arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+
 	return 0;
+}
+
+static int cmd_join(int argc, char **argv)
+{
+	struct arg_lit *help, *arg_dryrun;
+	struct arg_int *arg_romwidth, *arg_rombanks, *arg_trim, *arg_pad;
+	struct arg_file *arg_output, *arg_roms;
+	struct arg_end *end;
+
+	static const char *roms_help =
+			"ROM images, in bus order within a bank and then bank by bank, "
+			"ie the same order 'romjak split' wrote them";
+
+	static const char *trim_help =
+			"Truncate the output to this many bytes, to drop the padding "
+			"a split added";
+
+	void *argtable[] = {
+		help         = arg_litn("h", "help", 0, 1, "display this help and exit"),
+		arg_romwidth = arg_intn(NULL, "romwidth", "<n>", 0, 1,
+					"Data bus width of a single ROM in bits (multiple of 8), defaults to 8"),
+		arg_rombanks = arg_intn(NULL, "rombanks", "<n>", 0, 1,
+					"How many banks the ROMs are split into, defaults to 1"),
+		arg_trim     = arg_intn(NULL, "trim", "<n>", 0, 1, trim_help),
+		arg_pad      = arg_intn(NULL, "pad", "<byte>", 0, 1,
+					"Byte value the split padded with, defaults to 0xff"),
+		arg_dryrun   = arg_litn("n", "dry-run", 0, 1,
+					"Show the layout and work out the sizes, but write nothing"),
+		arg_output   = arg_file1("o", "output", "<file>", "where to write the joined binary"),
+		arg_roms     = arg_filen(NULL, NULL, "<rom>", 1, MAXROMS, roms_help),
+		end          = arg_end(20),
+	};
+
+	const char *progname = "romjak join";
+	int nerrors = arg_parse(argc, argv, argtable);
+
+	if (help->count > 0) {
+		printf("Usage: %s", progname);
+		arg_print_syntax(stdout, argtable, "\n");
+		printf("Join a set of ROM images back into the binary they came from.\n\n");
+		arg_print_glossary(stdout, argtable, "  %-25s %s\n");
+		printf("\nSizes accept 0x hex and KB/MB suffixes, eg --trim=32KB\n");
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 0;
+	}
+
+	if (nerrors > 0) {
+		arg_print_errors(stderr, end, progname);
+		fprintf(stderr, "Try 'romjak join --help' for more information.\n");
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 1;
+	}
+
+	/*
+	 * Unlike split, the geometry is mostly read off the files we were
+	 * given: one ROM per argument, all the same size.
+	 */
+	FILE *inputs[MAXROMS] = { 0 };
+	long romsize = 0;
+
+	for (int i = 0; i < arg_roms->count; i++) {
+		const char *name = arg_roms->filename[i];
+
+		inputs[i] = fopen(name, "rb");
+		if (!inputs[i]) {
+			fprintf(stderr, "Couldn't open '%s': %s\n", name, strerror(errno));
+			return 1;
+		}
+
+		fseek(inputs[i], 0L, SEEK_END);
+		long sz = ftell(inputs[i]);
+		rewind(inputs[i]);
+
+		if (sz <= 0) {
+			fprintf(stderr, "'%s' is empty\n", name);
+			return 1;
+		}
+		if (i == 0) {
+			romsize = sz;
+		} else if (sz != romsize) {
+			fprintf(stderr,
+					"'%s' is %ld bytes but '%s' is %ld - all the ROMs must be the same size\n",
+					name, sz, arg_roms->filename[0], romsize);
+			return 1;
+		}
+	}
+
+	struct romgeom g = {
+		.numroms  = arg_roms->count,
+		.romsize  = (int)romsize,
+		.romwidth = get_arg_or_default(arg_romwidth, 8),
+		.rombanks = get_arg_or_default(arg_rombanks, 1),
+		.padbyte  = get_arg_or_default(arg_pad, 0xff),
+	};
+
+	const char *err = geom_derive(&g);
+	if (err) {
+		fprintf(stderr, "%s: %s\n", progname, err);
+		return 1;
+	}
+
+	int trim = get_arg_or_default(arg_trim, 0);
+	if (trim < 0 || trim > g.totalsz) {
+		fprintf(stderr, "trim (%d) must be between 0 and the joined size (%d)\n",
+				trim, g.totalsz);
+		return 1;
+	}
+
+	char names[MAXBANKS][MAXROMS][MAXNAME] = { 0 };
+	for (int i = 0; i < g.rombanks; i++) {
+		for (int j = 0; j < g.romsperbank; j++)
+			snprintf(names[i][j], MAXNAME, "%s",
+					arg_roms->filename[(i * g.romsperbank) + j]);
+	}
+
+	printf("Joining %d ROMs of %d bytes, %d bank(s), %d-bit each into %s:\n\n",
+			g.numroms, g.romsize, g.rombanks, g.romwidth,
+			arg_output->filename[0]);
+
+	print_layout(&g, names);
+
+	printf("\nRead in that order, top left to bottom right, that is %d bytes",
+			g.totalsz);
+	if (trim)
+		printf(", trimmed to %d", trim);
+	printf(".\n\n");
+
+	if (arg_dryrun->count) {
+		printf("Dry run, nothing written.\n");
+		for (int i = 0; i < g.numroms; i++)
+			fclose(inputs[i]);
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 0;
+	}
+
+	FILE *output = fopen(arg_output->filename[0], "wb");
+	if (!output) {
+		fprintf(stderr, "Couldn't open '%s' for writing: %s\n",
+				arg_output->filename[0], strerror(errno));
+		return 1;
+	}
+
+	printf("Doing it..\n");
+
+	/*
+	 * Count the run of pad bytes at the tail so we can tell the user how
+	 * much of what they just got back is filler rather than data.
+	 */
+	long written = 0;
+	long trailing_pad = 0;
+
+	for_each_stride(&g, this_bank, this_rom, pos_abs) {
+		FILE *in = inputs[this_bank * g.romsperbank + this_rom];
+		uint8_t data[MAXSTRIDE];
+
+		if (fread(data, 1, g.stride, in) != (size_t)g.stride) {
+			fprintf(stderr, "Read from '%s' failed: %s\n",
+					arg_roms->filename[this_bank * g.romsperbank + this_rom],
+					ferror(in) ? strerror(errno) : "unexpected end of file");
+			return 1;
+		}
+
+		int n = g.stride;
+		if (trim && written + n > trim)
+			n = (int)(trim - written);
+		if (n <= 0)
+			continue;
+
+		if (fwrite(data, 1, n, output) != (size_t)n) {
+			fprintf(stderr, "Write to '%s' failed: %s\n",
+					arg_output->filename[0], strerror(errno));
+			return 1;
+		}
+
+		for (int k = 0; k < n; k++) {
+			if (data[k] == (uint8_t)g.padbyte)
+				trailing_pad++;
+			else
+				trailing_pad = 0;
+		}
+
+		written += n;
+	}
+
+	for (int i = 0; i < g.numroms; i++)
+		fclose(inputs[i]);
+
+	if (fclose(output) != 0) {
+		fprintf(stderr, "Couldn't finish writing '%s': %s\n",
+				arg_output->filename[0], strerror(errno));
+		return 1;
+	}
+
+	printf("Wrote %ld bytes to %s\n", written, arg_output->filename[0]);
+	/* A byte or two of pad value at the end is just data, don't cry wolf */
+	if (trailing_pad >= 16)
+		printf("Note: the last %ld bytes are 0x%02x, so they are probably padding.\n"
+			   "      Use --trim=<n> to cut the output down to the real data.\n",
+				trailing_pad, g.padbyte);
+
+	printf("Done\n");
+
+	arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+
+	return 0;
+}
+
+static void usage(FILE *out)
+{
+	fprintf(out,
+		"romjak - for jacking them roms\n"
+		"\n"
+		"Usage: romjak <command> [options]\n"
+		"\n"
+		"Commands:\n"
+		"  split    Split a binary across a set of ROM images for burning\n"
+		"  join     Join a set of ROM images back into one binary\n"
+		"\n"
+		"Try 'romjak <command> --help' for the options of each.\n");
+}
+
+int main(int argc, char **argv)
+{
+	if (argc < 2) {
+		usage(stderr);
+		return 1;
+	}
+
+	if (!strcmp(argv[1], "split"))
+		return cmd_split(argc - 1, argv + 1);
+
+	if (!strcmp(argv[1], "join"))
+		return cmd_join(argc - 1, argv + 1);
+
+	if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
+		usage(stdout);
+		return 0;
+	}
+
+	fprintf(stderr, "romjak: unknown command '%s'\n\n", argv[1]);
+	usage(stderr);
+	return 1;
 }

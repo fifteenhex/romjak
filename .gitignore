@@ -1,0 +1,5 @@
+build/
+
+# Wrap subprojects are downloaded by meson setup, not checked in
+subprojects/*
+!subprojects/*.wrap
