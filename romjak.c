@@ -371,6 +371,196 @@ static int cmd_split(int argc, char **argv)
 	return 0;
 }
 
+static int cmd_join(int argc, char **argv)
+{
+	struct arg_lit *help;
+	struct arg_int *arg_romwidth, *arg_rombanks, *arg_trim;
+	struct arg_file *arg_output, *arg_roms;
+	struct arg_end *end;
+
+	static const char *roms_help =
+			"ROM images, in bus order within a bank and then bank by bank, "
+			"ie the same order 'romjak split' wrote them";
+
+	static const char *trim_help =
+			"Truncate the output to this many bytes, to drop the padding "
+			"a split added";
+
+	void *argtable[] = {
+		help         = arg_litn("h", "help", 0, 1, "display this help and exit"),
+		arg_romwidth = arg_intn(NULL, "romwidth", "<n>", 0, 1,
+					"Data bus width of a single ROM in bits (multiple of 8), defaults to 8"),
+		arg_rombanks = arg_intn(NULL, "rombanks", "<n>", 0, 1,
+					"How many banks the ROMs are split into, defaults to 1"),
+		arg_trim     = arg_intn(NULL, "trim", "<n>", 0, 1, trim_help),
+		arg_output   = arg_file1("o", "output", "<file>", "where to write the joined binary"),
+		arg_roms     = arg_filen(NULL, NULL, "<rom>", 1, MAXROMS, roms_help),
+		end          = arg_end(20),
+	};
+
+	const char *progname = "romjak join";
+	int nerrors = arg_parse(argc, argv, argtable);
+
+	if (help->count > 0) {
+		printf("Usage: %s", progname);
+		arg_print_syntax(stdout, argtable, "\n");
+		printf("Join a set of ROM images back into the binary they came from.\n\n");
+		arg_print_glossary(stdout, argtable, "  %-25s %s\n");
+		printf("\nSizes accept 0x hex and KB/MB suffixes, eg --trim=32KB\n");
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 0;
+	}
+
+	if (nerrors > 0) {
+		arg_print_errors(stderr, end, progname);
+		fprintf(stderr, "Try 'romjak join --help' for more information.\n");
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 1;
+	}
+
+	/*
+	 * Unlike split, the geometry is mostly read off the files we were
+	 * given: one ROM per argument, all the same size.
+	 */
+	FILE *inputs[MAXROMS] = { 0 };
+	long romsize = 0;
+
+	for (int i = 0; i < arg_roms->count; i++) {
+		const char *name = arg_roms->filename[i];
+
+		inputs[i] = fopen(name, "rb");
+		if (!inputs[i]) {
+			fprintf(stderr, "Couldn't open '%s': %s\n", name, strerror(errno));
+			return 1;
+		}
+
+		fseek(inputs[i], 0L, SEEK_END);
+		long sz = ftell(inputs[i]);
+		rewind(inputs[i]);
+
+		if (sz <= 0) {
+			fprintf(stderr, "'%s' is empty\n", name);
+			return 1;
+		}
+		if (i == 0) {
+			romsize = sz;
+		} else if (sz != romsize) {
+			fprintf(stderr,
+					"'%s' is %ld bytes but '%s' is %ld - all the ROMs must be the same size\n",
+					name, sz, arg_roms->filename[0], romsize);
+			return 1;
+		}
+	}
+
+	struct romgeom g = {
+		.numroms  = arg_roms->count,
+		.romsize  = (int)romsize,
+		.romwidth = get_arg_or_default(arg_romwidth, 8),
+		.rombanks = get_arg_or_default(arg_rombanks, 1),
+	};
+
+	const char *err = geom_derive(&g);
+	if (err) {
+		fprintf(stderr, "%s: %s\n", progname, err);
+		return 1;
+	}
+
+	int trim = get_arg_or_default(arg_trim, 0);
+	if (trim < 0 || trim > g.totalsz) {
+		fprintf(stderr, "trim (%d) must be between 0 and the joined size (%d)\n",
+				trim, g.totalsz);
+		return 1;
+	}
+
+	printf("Going to join %d ROMs of %d bytes into %s:\n"
+		   " - Total data %d bytes, %d bytes per bank across %d bank(s)\n"
+		   " - Output data stride (how many bytes taken from a ROM at a time) is %d bytes\n",
+			g.numroms, g.romsize, arg_output->filename[0],
+			g.totalsz, g.banksz, g.rombanks, g.stride);
+
+	printf("Reading the ROMs in this order:\n");
+	for (int i = 0; i < g.rombanks; i++) {
+		unsigned int bank_start = g.banksz * i;
+		unsigned int bank_end = (g.banksz * (i + 1)) - 1;
+
+		printf(" - bank %d [0x%08x - 0x%08x]:", i, bank_start, bank_end);
+		for (int j = 0; j < g.romsperbank; j++)
+			printf(" rom %d - %s", j, arg_roms->filename[i * g.romsperbank + j]);
+		printf("\n");
+	}
+
+	FILE *output = fopen(arg_output->filename[0], "wb");
+	if (!output) {
+		fprintf(stderr, "Couldn't open '%s' for writing: %s\n",
+				arg_output->filename[0], strerror(errno));
+		return 1;
+	}
+
+	printf("Doing it..\n");
+
+	/*
+	 * Count the run of pad bytes at the tail so we can tell the user how
+	 * much of what they just got back is filler rather than data.
+	 */
+	long written = 0;
+	long trailing_pad = 0;
+
+	for_each_stride(&g, this_bank, this_rom, pos_abs) {
+		FILE *in = inputs[this_bank * g.romsperbank + this_rom];
+		uint8_t data[MAXSTRIDE];
+
+		if (fread(data, 1, g.stride, in) != (size_t)g.stride) {
+			fprintf(stderr, "Read from '%s' failed: %s\n",
+					arg_roms->filename[this_bank * g.romsperbank + this_rom],
+					ferror(in) ? strerror(errno) : "unexpected end of file");
+			return 1;
+		}
+
+		int n = g.stride;
+		if (trim && written + n > trim)
+			n = (int)(trim - written);
+		if (n <= 0)
+			continue;
+
+		if (fwrite(data, 1, n, output) != (size_t)n) {
+			fprintf(stderr, "Write to '%s' failed: %s\n",
+					arg_output->filename[0], strerror(errno));
+			return 1;
+		}
+
+		for (int k = 0; k < n; k++) {
+			if (data[k] == 0xff)
+				trailing_pad++;
+			else
+				trailing_pad = 0;
+		}
+
+		written += n;
+	}
+
+	for (int i = 0; i < g.numroms; i++)
+		fclose(inputs[i]);
+
+	if (fclose(output) != 0) {
+		fprintf(stderr, "Couldn't finish writing '%s': %s\n",
+				arg_output->filename[0], strerror(errno));
+		return 1;
+	}
+
+	printf("Wrote %ld bytes to %s\n", written, arg_output->filename[0]);
+	/* A byte or two of 0xff at the end is just data, don't cry wolf */
+	if (trailing_pad >= 16)
+		printf("Note: the last %ld bytes are 0xff, so they are probably padding.\n"
+			   "      Use --trim=<n> to cut the output down to the real data.\n",
+				trailing_pad);
+
+	printf("Done\n");
+
+	arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+
+	return 0;
+}
+
 static void usage(FILE *out)
 {
 	fprintf(out,
@@ -380,6 +570,7 @@ static void usage(FILE *out)
 		"\n"
 		"Commands:\n"
 		"  split    Split a binary across a set of ROM images for burning\n"
+		"  join     Join a set of ROM images back into one binary\n"
 		"\n"
 		"Try 'romjak <command> --help' for the options of each.\n");
 }
@@ -393,6 +584,9 @@ int main(int argc, char **argv)
 
 	if (!strcmp(argv[1], "split"))
 		return cmd_split(argc - 1, argv + 1);
+
+	if (!strcmp(argv[1], "join"))
+		return cmd_join(argc - 1, argv + 1);
 
 	if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
 		usage(stdout);
