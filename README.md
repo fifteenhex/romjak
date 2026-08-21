@@ -21,7 +21,8 @@ argtable3 comes from a wrap, so there is nothing to install first.
 
 ```
 romjak split --numroms=<n> --romsize=<n> [--romwidth=<n>] [--rombanks=<n>]
-             [--paduptosize=<n>] [--pad=<byte>] [-n] <file> [<basename>]
+             [--paduptosize=<n>] [--pad=<byte>] [--reverse]
+             [-n] <file> [<basename>]
 ```
 
 Sizes take `0x` hex and `KB`/`MB` suffixes, so `--romsize=32KB` and
@@ -66,6 +67,48 @@ big one copy of the input is; anything left over in a copy is filled with
 repeated until the parts are full. Leave `--paduptosize` off and you get a
 single copy padded out to the total. An input bigger than a copy gets
 truncated, and romjak says so before it does it.
+
+### Reversing the ROMs, and the 68000 case
+
+By default the first image carries byte +0, the next byte +1, and so on.
+Boards do not always agree, so `--reverse` turns the set end for end: the
+first image carries the last byte of the bus word instead of the first.
+
+A 68000 has a 16-bit bus and is big-endian, so the byte at an even address
+is the high byte and sits on D15-D8; odd addresses are the low byte on
+D7-D0. romjak's default therefore already matches "high byte first" - burn
+`prog.0` into the D15-D8 socket and you are done:
+
+```
+$ romjak split -n --numroms=2 --romsize=32KB prog.bin prog
+
+            byte +0      byte +1
+         +------------+------------+
+ bank 0  |   prog.0   |   prog.1   |  0x00000000
+         |  32768 B   |  32768 B   |   - 0x0000ffff
+         +------------+------------+
+```
+
+Plenty of boards number their sockets the other way round though, with
+IC1 on D7-D0, and plenty of existing ROM sets are named `.lo`/`.hi` low
+first. `--reverse` and the first image becomes the low byte:
+
+```
+$ romjak split -n --numroms=2 --romsize=32KB --reverse prog.bin prog
+
+            byte +1      byte +0
+         +------------+------------+
+ bank 0  |   prog.0   |   prog.1   |  0x00000000
+         |  32768 B   |  32768 B   |   - 0x0000ffff
+         +------------+------------+
+```
+
+The column headers are the check: they say what each chip ends up holding,
+so you can compare the picture against the board before burning anything.
+
+`join` takes the same flag and it has to match the split, otherwise the
+bytes come back swapped. Wider sets reverse the same way - four 8-bit ROMs
+on a 32-bit big-endian bus want `--reverse` too.
 
 ### What --paduptosize is for
 
@@ -112,7 +155,7 @@ from the input path, so `roms/game.bin` gives `game.0`, `game.1`, ...
 
 ```
 romjak join [--romwidth=<n>] [--rombanks=<n>] [--trim=<n>] [--pad=<byte>]
-            [-n] -o <file> <rom>...
+            [--reverse] [-n] -o <file> <rom>...
 ```
 
 The inverse. Give it the images in bus order within a bank and then bank
