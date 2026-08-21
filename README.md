@@ -67,6 +67,43 @@ repeated until the parts are full. Leave `--paduptosize` off and you get a
 single copy padded out to the total. An input bigger than a copy gets
 truncated, and romjak says so before it does it.
 
+### What --paduptosize is for
+
+Say the board wants two 8-bit EPROMs on a 16-bit bus, but only decodes 14
+address lines - it can see 16KB of the pair. You have 27C256s, which are
+32KB each, so the pair is 64KB and the top two address lines are not
+connected to anything. Whatever those lines happen to float or strap to,
+the CPU has to find your program.
+
+So put a copy in all four quarters. The program is 10240 bytes, one
+quarter is 16KB:
+
+```
+$ romjak split -n --numroms=2 --romsize=32KB --paduptosize=16KB prog.bin prog
+Splitting prog.bin (10240 bytes) over 2 ROMs of 32768 bytes, 1 bank(s), 8-bit each:
+
+            byte +0      byte +1
+         +------------+------------+
+ bank 0  |   prog.0   |   prog.1   |  0x00000000
+         |  32768 B   |  32768 B   |   - 0x0000ffff
+         +------------+------------+
+
+Which holds 65536 bytes altogether, laid out like this:
+
+         0x00000000                                              0x00010000
+         +----------------+----------------+----------------+----------------+
+         |##########......|##########......|##########......|##########......|
+         +----------------+----------------+----------------+----------------+
+         # 10240 bytes of data   . 6144 bytes of 0xff pad   x 4 copies of 16384 bytes
+
+Dry run, nothing written.
+```
+
+Four copies, each 10240 bytes of program followed by 6144 bytes of `0xff`
+so the next copy starts exactly on a 16KB boundary. Miss `--paduptosize`
+off and you would get one copy at the bottom and 54KB of `0xff` above it,
+which works only if those two address lines happen to come up low.
+
 Outputs are named `<basename>.<rom>` for one bank and
 `<basename>.<bank>.<rom>` for several. Leave the basename off and it comes
 from the input path, so `roms/game.bin` gives `game.0`, `game.1`, ...
