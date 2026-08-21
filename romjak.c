@@ -33,6 +33,7 @@ struct romgeom {
 	int romwidth;		/* bits */
 	int rombanks;
 	int paduptosize;
+	int padbyte;
 
 	/* worked out from the above */
 	int stride;		/* bytes one ROM takes at a time */
@@ -83,6 +84,10 @@ static const char *geom_derive(struct romgeom *g)
 	if (g->romwidth < 8 || g->romwidth > MAXROMWIDTH) {
 		snprintf(err, sizeof(err), "ROM width must be between 8 and %d bits",
 				MAXROMWIDTH);
+		return err;
+	}
+	if (g->padbyte < 0 || g->padbyte > 0xff) {
+		snprintf(err, sizeof(err), "the pad byte must be between 0 and 255");
 		return err;
 	}
 
@@ -294,8 +299,8 @@ static void print_datamap(const struct romgeom *g, long inputsize)
 				inputsize, g->paduptosize);
 
 	if (g->repeats > 16) {
-		printf("%d copies of %ld bytes of data + %d bytes of 0xff pad, too many to draw.\n",
-				g->repeats, datalen, g->paduptosize - (int)datalen);
+		printf("%d copies of %ld bytes of data + %d bytes of 0x%02x pad, too many to draw.\n",
+				g->repeats, datalen, g->paduptosize - (int)datalen, g->padbyte);
 		return;
 	}
 
@@ -344,9 +349,10 @@ static void print_datamap(const struct romgeom *g, long inputsize)
 	}
 	putchar('\n');
 
-	printf("%*s# %ld bytes of data   . %d bytes of 0xff pad   x %d cop%s of %d bytes\n",
+	printf("%*s# %ld bytes of data   . %d bytes of 0x%02x pad   x %d cop%s of %d bytes\n",
 			LAYOUT_MARGIN, "", datalen, g->paduptosize - (int)datalen,
-			g->repeats, g->repeats == 1 ? "y" : "ies", g->paduptosize);
+			g->padbyte, g->repeats, g->repeats == 1 ? "y" : "ies",
+			g->paduptosize);
 }
 
 /*
@@ -364,10 +370,10 @@ static void print_datamap(const struct romgeom *g, long inputsize)
 
 static int cmd_split(int argc, char **argv)
 {
-	struct arg_lit *help;
+	struct arg_lit *help, *arg_dryrun;
 	struct arg_int *arg_numroms, *arg_romwidth,
 				   *arg_romsize, *arg_rombanks,
-				   *arg_paduptosize;
+				   *arg_paduptosize, *arg_pad;
 	struct arg_file *arg_input;
 	struct arg_str *arg_basename;
 	struct arg_end *end;
@@ -396,6 +402,10 @@ static int cmd_split(int argc, char **argv)
 		arg_romsize     = arg_int1(NULL, "romsize", "<n>", "Size of a single ROM in bytes"),
 		arg_rombanks    = arg_intn(NULL, "rombanks", "<n>", 0, 1, "How many banks of ROMs, defaults to 1"),
 		arg_paduptosize = arg_intn(NULL, "paduptosize", "<n>", 0, 1, paduptosize_help),
+		arg_pad         = arg_intn(NULL, "pad", "<byte>", 0, 1,
+					"Byte value to pad with, defaults to 0xff (erased EPROM)"),
+		arg_dryrun      = arg_litn("n", "dry-run", 0, 1,
+					"Show the layout and work out the sizes, but write nothing"),
 		arg_input       = arg_file1(NULL, NULL, "<file>", "input file"),
 		arg_basename    = arg_strn(NULL, NULL, "<output basename>", 0, 1, basename_help),
 		end             = arg_end(20),
@@ -427,6 +437,7 @@ static int cmd_split(int argc, char **argv)
 		.romwidth    = get_arg_or_default(arg_romwidth, 8),
 		.rombanks    = get_arg_or_default(arg_rombanks, 1),
 		.paduptosize = get_arg_or_default(arg_paduptosize, 0),
+		.padbyte     = get_arg_or_default(arg_pad, 0xff),
 	};
 
 	const char *err = geom_derive(&g);
@@ -475,6 +486,13 @@ static int cmd_split(int argc, char **argv)
 
 	putchar('\n');
 
+	if (arg_dryrun->count) {
+		printf("Dry run, nothing written.\n");
+		fclose(input);
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 0;
+	}
+
 	/* Open all of the outputs */
 	FILE *outputs[MAXBANKS][MAXROMS] = { 0 };
 
@@ -494,7 +512,7 @@ static int cmd_split(int argc, char **argv)
 	for_each_stride(&g, this_bank, this_rom, pos_abs) {
 		FILE *output = outputs[this_bank][this_rom];
 		uint8_t data[MAXSTRIDE];
-		memset(data, 0xff, sizeof(data));
+		memset(data, g.padbyte, sizeof(data));
 
 		/* Where are we in the current repeat of the input? */
 		unsigned int pos_repeat = pos_abs % g.paduptosize;
@@ -542,8 +560,8 @@ static int cmd_split(int argc, char **argv)
 
 static int cmd_join(int argc, char **argv)
 {
-	struct arg_lit *help;
-	struct arg_int *arg_romwidth, *arg_rombanks, *arg_trim;
+	struct arg_lit *help, *arg_dryrun;
+	struct arg_int *arg_romwidth, *arg_rombanks, *arg_trim, *arg_pad;
 	struct arg_file *arg_output, *arg_roms;
 	struct arg_end *end;
 
@@ -562,6 +580,10 @@ static int cmd_join(int argc, char **argv)
 		arg_rombanks = arg_intn(NULL, "rombanks", "<n>", 0, 1,
 					"How many banks the ROMs are split into, defaults to 1"),
 		arg_trim     = arg_intn(NULL, "trim", "<n>", 0, 1, trim_help),
+		arg_pad      = arg_intn(NULL, "pad", "<byte>", 0, 1,
+					"Byte value the split padded with, defaults to 0xff"),
+		arg_dryrun   = arg_litn("n", "dry-run", 0, 1,
+					"Show the layout and work out the sizes, but write nothing"),
 		arg_output   = arg_file1("o", "output", "<file>", "where to write the joined binary"),
 		arg_roms     = arg_filen(NULL, NULL, "<rom>", 1, MAXROMS, roms_help),
 		end          = arg_end(20),
@@ -626,6 +648,7 @@ static int cmd_join(int argc, char **argv)
 		.romsize  = (int)romsize,
 		.romwidth = get_arg_or_default(arg_romwidth, 8),
 		.rombanks = get_arg_or_default(arg_rombanks, 1),
+		.padbyte  = get_arg_or_default(arg_pad, 0xff),
 	};
 
 	const char *err = geom_derive(&g);
@@ -659,6 +682,14 @@ static int cmd_join(int argc, char **argv)
 	if (trim)
 		printf(", trimmed to %d", trim);
 	printf(".\n\n");
+
+	if (arg_dryrun->count) {
+		printf("Dry run, nothing written.\n");
+		for (int i = 0; i < g.numroms; i++)
+			fclose(inputs[i]);
+		arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+		return 0;
+	}
 
 	FILE *output = fopen(arg_output->filename[0], "wb");
 	if (!output) {
@@ -700,7 +731,7 @@ static int cmd_join(int argc, char **argv)
 		}
 
 		for (int k = 0; k < n; k++) {
-			if (data[k] == 0xff)
+			if (data[k] == (uint8_t)g.padbyte)
 				trailing_pad++;
 			else
 				trailing_pad = 0;
@@ -719,11 +750,11 @@ static int cmd_join(int argc, char **argv)
 	}
 
 	printf("Wrote %ld bytes to %s\n", written, arg_output->filename[0]);
-	/* A byte or two of 0xff at the end is just data, don't cry wolf */
+	/* A byte or two of pad value at the end is just data, don't cry wolf */
 	if (trailing_pad >= 16)
-		printf("Note: the last %ld bytes are 0xff, so they are probably padding.\n"
+		printf("Note: the last %ld bytes are 0x%02x, so they are probably padding.\n"
 			   "      Use --trim=<n> to cut the output down to the real data.\n",
-				trailing_pad);
+				trailing_pad, g.padbyte);
 
 	printf("Done\n");
 
