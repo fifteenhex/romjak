@@ -11,7 +11,9 @@
 #define MAXROMWIDTH	32
 #define MAXSTRIDE	(MAXROMWIDTH/8)
 #define MAXBANKS	4
-#define MAXROMSPERBANK (MAXROMS/MAXBANKS)
+#define MAXNAME		256
+/* Leaves room for the ".<bank>.<rom>" suffix we append */
+#define MAXBASENAME	(MAXNAME - 16)
 
 static int get_arg_or_default(struct arg_int *arg, int defval)
 {
@@ -19,6 +21,31 @@ static int get_arg_or_default(struct arg_int *arg, int defval)
 		return arg->ival[0];
 	else
 		return defval;
+}
+
+/*
+ * Work out a default output basename from the input path:
+ * "roms/game.bin" becomes "game".
+ */
+static void default_basename(const char *path, char *out, size_t outsz)
+{
+	const char *slash = strrchr(path, '/');
+	const char *start = slash ? slash + 1 : path;
+	const char *dot = strrchr(start, '.');
+	size_t len = dot ? (size_t)(dot - start) : strlen(start);
+
+	/* A name like ".bin" has no stem, so keep the lot */
+	if (len == 0)
+		len = strlen(start);
+	if (len >= outsz)
+		len = outsz - 1;
+	if (len == 0) {
+		snprintf(out, outsz, "rom");
+		return;
+	}
+
+	memcpy(out, start, len);
+	out[len] = '\0';
 }
 
 int main(int argc, char **argv) {
@@ -68,7 +95,7 @@ int main(int argc, char **argv) {
 	{
 		printf("Usage: %s", progname);
 		arg_print_syntax(stdout, argtable, "\n");
-		printf("Demonstrate command-line parsing in argtable3.\n\n");
+		printf("Split a binary across a set of ROM images for burning.\n\n");
 		arg_print_glossary(stdout, argtable, "  %-25s %s\n");
 		exit(0);
 	}
@@ -86,6 +113,12 @@ int main(int argc, char **argv) {
 	 */
 	int numroms = *arg_numroms->ival;
 	int romsize = *arg_romsize->ival;
+
+	if (numroms < 1 || romsize < 1) {
+		printf("numroms and romsize must both be at least 1\n");
+		exit(1);
+	}
+
 	int totalsz = romsize * numroms;
 
 	/*
@@ -100,8 +133,17 @@ int main(int argc, char **argv) {
 	/* Get the width of each ROM, 8 if unspecified */
 	const int romwidth = get_arg_or_default(arg_romwidth, 8);
 
+	if (paduptosize < 1) {
+		printf("paduptosize must be at least 1\n");
+		exit(1);
+	}
+
 	/* Check the numbers are logical */
 	/* Banks */
+	if (rombanks < 1) {
+		printf("rombanks must be at least 1\n");
+		exit(1);
+	}
 	if (rombanks > MAXBANKS) {
 		printf("Sorry, too many banks\n");
 		exit(1);
@@ -116,14 +158,6 @@ int main(int argc, char **argv) {
 		printf("ROM width is too big\n");
 		exit(1);
 	}
-
-#if 0
-	/* Pad size */
-	if ((romsize % paduptosize) != 0) {
-		printf("romsize must be a multiple of paduptosize\n");
-		exit(1);
-	}
-#endif
 
 	/* Number of ROMs */
 	if ((numroms % rombanks) != 0) {
@@ -141,7 +175,24 @@ int main(int argc, char **argv) {
 	int banksz = romsize * romsperbank;
 
 	int stride = romwidth / 8;
-	int repeats = romsize / paduptosize;
+	int repeats = totalsz / paduptosize;
+
+	/*
+	 * The input is walked sequentially, one stride at a time, and rewound
+	 * every time we cross a paduptosize boundary. That only lines up if
+	 * the boundaries fall on a stride, and if the output is a whole
+	 * number of copies.
+	 */
+	if ((paduptosize % stride) != 0) {
+		printf("paduptosize (%d) must be a multiple of the ROM stride (%d bytes)\n",
+				paduptosize, stride);
+		exit(1);
+	}
+	if ((totalsz % paduptosize) != 0) {
+		printf("total size (%d) must be a multiple of paduptosize (%d)\n",
+				totalsz, paduptosize);
+		exit(1);
+	}
 
 	/* Print it all out because I no good at math */
 	printf("Going to create outputs for %d ROMs:\n"
@@ -152,16 +203,21 @@ int main(int argc, char **argv) {
 			numroms, totalsz, banksz, romsize, stride, repeats);
 
 	/* Work out the resulting file names */
-	const char *basename = arg_basename->sval[0];
-	char output_names[MAXBANKS][MAXROMS][256] = { 0 };
+	char basename[MAXBASENAME];
+	if (arg_basename->count && arg_basename->sval[0] && arg_basename->sval[0][0])
+		snprintf(basename, sizeof(basename), "%s", arg_basename->sval[0]);
+	else
+		default_basename(arg_input->filename[0], basename, sizeof(basename));
+
+	char output_names[MAXBANKS][MAXROMS][MAXNAME] = { 0 };
 	if (rombanks == 1) {
 		for (int i = 0; i < romsperbank; i++)
-			sprintf(output_names[0][i], "%s.%d", basename, i);
+			snprintf(output_names[0][i], MAXNAME, "%s.%d", basename, i);
 	}
 	else {
 		for (int i = 0; i < rombanks; i++) {
 			for (int j = 0; j < romsperbank; j++)
-				sprintf(output_names[i][j], "%s.%d.%d", basename, i, j);
+				snprintf(output_names[i][j], MAXNAME, "%s.%d.%d", basename, i, j);
 		}
 	}
 
@@ -178,23 +234,30 @@ int main(int argc, char **argv) {
 	}
 
 	/* Open all of the files */
-	FILE *outputs[MAXBANKS][MAXROMSPERBANK] = { 0 };
-	FILE *input = fopen(arg_input->filename[0], "r");
+	FILE *outputs[MAXBANKS][MAXROMS] = { 0 };
+	FILE *input = fopen(arg_input->filename[0], "rb");
 	if (!input) {
-		printf("Couldn't open the input file: %d\n", errno);
+		printf("Couldn't open the input file '%s': %s\n",
+				arg_input->filename[0], strerror(errno));
 		exit(1);
 	}
 
 	/* Get the input size */
 	fseek(input, 0L, SEEK_END);
-	int inputsize = ftell(input);
+	long inputsize = ftell(input);
 	rewind(input);
+
+	if (inputsize <= 0) {
+		printf("The input file is empty\n");
+		exit(1);
+	}
 
 	for (int i = 0; i < rombanks; i++) {
 		for (int j = 0; j < romsperbank; j++) {
-			outputs[i][j] = fopen(output_names[i][j], "w");
+			outputs[i][j] = fopen(output_names[i][j], "wb");
 			if (!outputs[i][j]) {
-				printf("Couldn't open one of the outputs for writing: %d\n", errno);
+				printf("Couldn't open '%s' for writing: %s\n",
+						output_names[i][j], strerror(errno));
 				exit(1);
 			}
 		}
@@ -220,20 +283,41 @@ int main(int argc, char **argv) {
 				if (pos_repeat == 0)
 					rewind(input);
 
-				if (pos_repeat < inputsize)
-					fread(data, stride, 1, input);
+				/*
+				 * A short read at the tail of the input just leaves the
+				 * rest of the stride as pad, which is what we want.
+				 */
+				if (pos_repeat < (unsigned long)inputsize)
+					fread(data, 1, stride, input);
 
-#if 0
-				printf("bank %d, rom %d, bank pos 0x%08x, abs pos 0x%08x, repeat pos 0x%08x\n",
-						this_bank, this_rom, pos_bank + (this_rom * stride),
-						pos_abs, pos_repeat);
-#endif
-
-				fwrite(data, stride, 1, output);
+				if (fwrite(data, 1, stride, output) != (size_t)stride) {
+					printf("Write to '%s' failed: %s\n",
+							output_names[this_bank][this_rom], strerror(errno));
+					exit(1);
+				}
 			}
 	}
 
+	if (ferror(input)) {
+		printf("Read from '%s' failed: %s\n",
+				arg_input->filename[0], strerror(errno));
+		exit(1);
+	}
+
+	fclose(input);
+	for (int i = 0; i < rombanks; i++) {
+		for (int j = 0; j < romsperbank; j++) {
+			if (fclose(outputs[i][j]) != 0) {
+				printf("Couldn't finish writing '%s': %s\n",
+						output_names[i][j], strerror(errno));
+				exit(1);
+			}
+		}
+	}
+
 	printf("Done\n");
+
+	arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
 
 	return 0;
 }
