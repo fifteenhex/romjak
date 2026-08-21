@@ -106,6 +106,59 @@ roundtrip "$tmp/odd.bin"   4 2  8 1024 --paduptosize=1024
 roundtrip "$tmp/odd.bin"   4 2  8 1024 --paduptosize=2048
 roundtrip "$tmp/odd.bin"   4 2  8 1024 --paduptosize=1024 --pad=0
 
+reversed_rt() { # <numroms> <rombanks> <romwidth> <romsize>
+	nr=$1 nb=$2 rw=$3 rs=$4
+
+	desc="reversed roundtrip numroms=$nr rombanks=$nb romwidth=$rw"
+	rm -f "$tmp"/rv.* "$tmp/rvback.bin"
+
+	"$ROMJAK" split --numroms="$nr" --rombanks="$nb" --romwidth="$rw" \
+			--romsize="$rs" --reverse \
+			"$tmp/in4k.bin" "$tmp/rv" >/dev/null 2>&1
+
+	insz=$(wc -c < "$tmp/in4k.bin")
+	# shellcheck disable=SC2046 # we want the name list word split
+	"$ROMJAK" join --rombanks="$nb" --romwidth="$rw" --reverse \
+			--trim="$insz" -o "$tmp/rvback.bin" \
+			$(romnames "$tmp/rv" "$nr" "$nb") >/dev/null 2>&1
+
+	if cmp -s "$tmp/in4k.bin" "$tmp/rvback.bin"; then
+		ok "$desc"
+	else
+		notok "$desc (joined output differs from the input)"
+	fi
+}
+
+echo "# round trips with the ROMs reversed"
+reversed_rt  2 1  8 2048
+reversed_rt  4 1  8 1024
+reversed_rt  8 1  8  512
+reversed_rt  4 2  8 1024
+reversed_rt 16 4  8  256
+reversed_rt  4 1 16 1024
+reversed_rt  2 1 32 2048
+
+echo "# reversing actually moves the data"
+rm -f "$tmp"/d.* "$tmp"/s.*
+"$ROMJAK" split --numroms=4 --romsize=1024 "$tmp/in4k.bin" "$tmp/d" >/dev/null 2>&1
+"$ROMJAK" split --numroms=4 --romsize=1024 --reverse "$tmp/in4k.bin" "$tmp/s" >/dev/null 2>&1
+swapped=yes
+for n in 0 1 2 3; do
+	cmp -s "$tmp/s.$n" "$tmp/d.$((3 - n))" || swapped=no
+done
+[ "$swapped" = yes ] && ok "--reverse turns the images end for end" \
+		|| notok "--reverse turns the images end for end"
+
+# Joining without --reverse has to produce something different, or the flag
+# is being quietly ignored and a bad burn looks fine
+# shellcheck disable=SC2046
+"$ROMJAK" join -o "$tmp/mismatch.bin" $(romnames "$tmp/s" 4 1) >/dev/null 2>&1
+if cmp -s "$tmp/in4k.bin" "$tmp/mismatch.bin"; then
+	notok "joining a reversed set without --reverse is caught"
+else
+	ok "joining a reversed set without --reverse is caught"
+fi
+
 echo "# padding and repeats land where they should"
 rm -f "$tmp"/rep.*
 "$ROMJAK" split --numroms=4 --rombanks=2 --romsize=1024 --paduptosize=1024 \

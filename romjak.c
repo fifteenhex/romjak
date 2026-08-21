@@ -34,6 +34,7 @@ struct romgeom {
 	int rombanks;
 	int paduptosize;
 	int padbyte;
+	int reverse;		/* ROMs sit on the bus the other way round */
 
 	/* worked out from the above */
 	int stride;		/* bytes one ROM takes at a time */
@@ -42,6 +43,19 @@ struct romgeom {
 	int totalsz;
 	int repeats;
 };
+
+/*
+ * Which byte of the bus word ROM j carries.
+ *
+ * Reversing is its own inverse, so this answers the question both ways
+ * round: given a ROM it gives the lane, and given a lane it gives the ROM
+ * that carries it. The copy loops need the second reading, because they
+ * walk the input in address order and look the chip up.
+ */
+static int geom_lane(const struct romgeom *g, int j)
+{
+	return g->reverse ? (g->romsperbank - 1 - j) : j;
+}
 
 /*
  * Fill in the derived fields and check the whole lot hangs together.
@@ -239,21 +253,22 @@ static void print_layout(const struct romgeom *g,
 	/* Which bytes of each bus word this column carries */
 	printf("%*s", LAYOUT_MARGIN, "");
 	for (int j = 0; j < g->romsperbank; j++) {
-		char lane[32];
+		char label[32];
+		int l = geom_lane(g, j);
 
 		if (g->stride == 1)
-			snprintf(lane, sizeof(lane), "byte +%d", j);
+			snprintf(label, sizeof(label), "byte +%d", l);
 		else
-			snprintf(lane, sizeof(lane), "bytes +%d..%d",
-					j * g->stride, ((j + 1) * g->stride) - 1);
+			snprintf(label, sizeof(label), "bytes +%d..%d",
+					l * g->stride, ((l + 1) * g->stride) - 1);
 
 		/* Chopping the front off a lane label loses the useful half */
-		if ((int)strlen(lane) > cellw)
-			snprintf(lane, sizeof(lane), "+%d..%d",
-					j * g->stride, ((j + 1) * g->stride) - 1);
+		if ((int)strlen(label) > cellw)
+			snprintf(label, sizeof(label), "+%d..%d",
+					l * g->stride, ((l + 1) * g->stride) - 1);
 
 		putchar(' ');
-		cell(lane, cellw);
+		cell(label, cellw);
 	}
 	putchar('\n');
 
@@ -357,20 +372,24 @@ static void print_datamap(const struct romgeom *g, long inputsize)
 
 /*
  * Walk the combined address space one stride at a time, in the order the
- * bytes appear in the binary, handing back which bank and ROM each stride
- * belongs to. This is the whole interleave, and both directions use it.
+ * bytes appear in the binary. This is the whole interleave, and both
+ * directions use it.
+ *
+ * It hands back the bank and the byte lane, not the ROM: the walk has to
+ * stay in address order so the input can be read straight through, so it
+ * is the chip that moves around. Use geom_lane() to get it.
  */
-#define for_each_stride(g, bank, rom, pos)					\
+#define for_each_stride(g, bank, lane, pos)					\
 	for (int bank = 0; bank < (g)->rombanks; bank++)			\
 		for (int row = 0; row < (g)->banksz;				\
 				row += (g)->romsperbank * (g)->stride)		\
-			for (int rom = 0, pos = (bank) * (g)->banksz + row;	\
-					rom < (g)->romsperbank;			\
-					rom++, pos += (g)->stride)
+			for (int lane = 0, pos = (bank) * (g)->banksz + row;	\
+					lane < (g)->romsperbank;		\
+					lane++, pos += (g)->stride)
 
 static int cmd_split(int argc, char **argv)
 {
-	struct arg_lit *help, *arg_dryrun;
+	struct arg_lit *help, *arg_dryrun, *arg_reverse;
 	struct arg_int *arg_numroms, *arg_romwidth,
 				   *arg_romsize, *arg_rombanks,
 				   *arg_paduptosize, *arg_pad;
@@ -395,6 +414,10 @@ static int cmd_split(int argc, char **argv)
 	static const char *basename_help =
 			"Base name for the outputs, defaults to something based on the input path";
 
+	static const char *reverse_help =
+			"Put the ROMs on the bus the other way round, so the first "
+			"image carries the last byte of the bus word instead of the first";
+
 	void *argtable[] = {
 		help            = arg_litn("h", "help", 0, 1, "display this help and exit"),
 		arg_numroms     = arg_int1(NULL, "numroms", "<n>", "Total number of ROMs"),
@@ -404,6 +427,7 @@ static int cmd_split(int argc, char **argv)
 		arg_paduptosize = arg_intn(NULL, "paduptosize", "<n>", 0, 1, paduptosize_help),
 		arg_pad         = arg_intn(NULL, "pad", "<byte>", 0, 1,
 					"Byte value to pad with, defaults to 0xff (erased EPROM)"),
+		arg_reverse     = arg_litn(NULL, "reverse", 0, 1, reverse_help),
 		arg_dryrun      = arg_litn("n", "dry-run", 0, 1,
 					"Show the layout and work out the sizes, but write nothing"),
 		arg_input       = arg_file1(NULL, NULL, "<file>", "input file"),
@@ -438,6 +462,7 @@ static int cmd_split(int argc, char **argv)
 		.rombanks    = get_arg_or_default(arg_rombanks, 1),
 		.paduptosize = get_arg_or_default(arg_paduptosize, 0),
 		.padbyte     = get_arg_or_default(arg_pad, 0xff),
+		.reverse     = arg_reverse->count > 0,
 	};
 
 	const char *err = geom_derive(&g);
@@ -509,7 +534,8 @@ static int cmd_split(int argc, char **argv)
 
 	printf("Doing it..\n");
 
-	for_each_stride(&g, this_bank, this_rom, pos_abs) {
+	for_each_stride(&g, this_bank, this_lane, pos_abs) {
+		int this_rom = geom_lane(&g, this_lane);
 		FILE *output = outputs[this_bank][this_rom];
 		uint8_t data[MAXSTRIDE];
 		memset(data, g.padbyte, sizeof(data));
@@ -560,7 +586,7 @@ static int cmd_split(int argc, char **argv)
 
 static int cmd_join(int argc, char **argv)
 {
-	struct arg_lit *help, *arg_dryrun;
+	struct arg_lit *help, *arg_dryrun, *arg_reverse;
 	struct arg_int *arg_romwidth, *arg_rombanks, *arg_trim, *arg_pad;
 	struct arg_file *arg_output, *arg_roms;
 	struct arg_end *end;
@@ -568,6 +594,10 @@ static int cmd_join(int argc, char **argv)
 	static const char *roms_help =
 			"ROM images, in bus order within a bank and then bank by bank, "
 			"ie the same order 'romjak split' wrote them";
+
+	static const char *reverse_help =
+			"Put the ROMs on the bus the other way round. Must match the "
+			"split, or the bytes come back swapped";
 
 	static const char *trim_help =
 			"Truncate the output to this many bytes, to drop the padding "
@@ -582,6 +612,7 @@ static int cmd_join(int argc, char **argv)
 		arg_trim     = arg_intn(NULL, "trim", "<n>", 0, 1, trim_help),
 		arg_pad      = arg_intn(NULL, "pad", "<byte>", 0, 1,
 					"Byte value the split padded with, defaults to 0xff"),
+		arg_reverse  = arg_litn(NULL, "reverse", 0, 1, reverse_help),
 		arg_dryrun   = arg_litn("n", "dry-run", 0, 1,
 					"Show the layout and work out the sizes, but write nothing"),
 		arg_output   = arg_file1("o", "output", "<file>", "where to write the joined binary"),
@@ -649,6 +680,7 @@ static int cmd_join(int argc, char **argv)
 		.romwidth = get_arg_or_default(arg_romwidth, 8),
 		.rombanks = get_arg_or_default(arg_rombanks, 1),
 		.padbyte  = get_arg_or_default(arg_pad, 0xff),
+		.reverse  = arg_reverse->count > 0,
 	};
 
 	const char *err = geom_derive(&g);
@@ -707,13 +739,14 @@ static int cmd_join(int argc, char **argv)
 	long written = 0;
 	long trailing_pad = 0;
 
-	for_each_stride(&g, this_bank, this_rom, pos_abs) {
-		FILE *in = inputs[this_bank * g.romsperbank + this_rom];
+	for_each_stride(&g, this_bank, this_lane, pos_abs) {
+		int idx = (this_bank * g.romsperbank) + geom_lane(&g, this_lane);
+		FILE *in = inputs[idx];
 		uint8_t data[MAXSTRIDE];
 
 		if (fread(data, 1, g.stride, in) != (size_t)g.stride) {
 			fprintf(stderr, "Read from '%s' failed: %s\n",
-					arg_roms->filename[this_bank * g.romsperbank + this_rom],
+					arg_roms->filename[idx],
 					ferror(in) ? strerror(errno) : "unexpected end of file");
 			return 1;
 		}
